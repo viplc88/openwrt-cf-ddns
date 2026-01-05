@@ -2,7 +2,7 @@
 
 # ============================================
 # Cloudflare DDNS for OpenWRT - Multi-Zone + Multi-Interface
-# Version: 2.0
+# Version: 2.0 FIXED
 # ============================================
 
 CONFIG_FILE="/etc/cloudflare-ddns/cloudflare-ddns.conf"
@@ -56,7 +56,6 @@ update_dns_record() {
     local ttl=${7:-120}
     
     # Convert string "true"/"false" to JSON boolean
-    # Cloudflare API requires boolean, not string
     local proxied_json
     if [ "$proxied" = "true" ]; then
         proxied_json="true"
@@ -71,6 +70,8 @@ update_dns_record() {
     # Build JSON payload
     local json_data="{\"type\":\"A\",\"name\":\"$record_name\",\"content\":\"$new_ip\",\"ttl\":$ttl,\"proxied\":$proxied_json}"
     
+    log_message "DEBUG: JSON sent: $json_data"
+    
     local response=$(curl --silent --request PATCH \
         --url "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
         --header "Authorization: Bearer $api_token" \
@@ -84,7 +85,6 @@ update_dns_record() {
     else
         local errors=$(echo "$response" | jsonfilter -e '@.errors')
         log_message "ERROR: Failed to update $record_name: $errors"
-        log_message "DEBUG: JSON sent: $json_data"
         return 1
     fi
 }
@@ -110,7 +110,6 @@ get_record_id_for_zone() {
 show_all_records() {
     log_message "=== Fetching all DNS records from Cloudflare ==="
     
-    # Parse config
     local api_tokens=$(echo "$CF_API_TOKENS" | tr ',' '\n')
     local zone_ids=$(echo "$CF_ZONE_IDS" | tr ',' '\n')
     local domains=$(echo "$CF_DOMAINS" | tr ',' '\n')
@@ -126,11 +125,9 @@ show_all_records() {
         local api_token=$(echo "$api_tokens" | sed -n "${count}p" | xargs)
         local zone_id=$(echo "$zone_ids" | sed -n "${count}p" | xargs)
         
-        # Use default if not specified
         [ -z "$api_token" ] && api_token="$DEFAULT_API_TOKEN"
         [ -z "$zone_id" ] && zone_id="$DEFAULT_ZONE_ID"
         
-        # Only fetch once per zone
         if [ "$zone_id" != "$prev_zone" ]; then
             get_record_id_for_zone "$api_token" "$zone_id" "$domain"
             prev_zone="$zone_id"
@@ -142,12 +139,13 @@ show_all_records() {
 show_status() {
     log_message "=== Cloudflare DDNS Status (Multi-Zone + Multi-Interface) ==="
     
-    # Parse all config arrays
     local domains=$(echo "$CF_DOMAINS" | tr ',' '\n')
     local interfaces=$(echo "$CF_INTERFACES" | tr ',' '\n')
     local api_tokens=$(echo "$CF_API_TOKENS" | tr ',' '\n')
     local zone_ids=$(echo "$CF_ZONE_IDS" | tr ',' '\n')
     local record_ids=$(echo "$CF_RECORD_IDS" | tr ',' '\n')
+    local proxied_list=$(echo "$CF_PROXIED" | tr ',' '\n')
+    local ttl_list=$(echo "$CF_TTL" | tr ',' '\n')
     
     local count=0
     echo "$domains" | while read domain; do
@@ -159,11 +157,14 @@ show_status() {
         local api_token=$(echo "$api_tokens" | sed -n "${count}p" | xargs)
         local zone_id=$(echo "$zone_ids" | sed -n "${count}p" | xargs)
         local record_id=$(echo "$record_ids" | sed -n "${count}p" | xargs)
+        local proxied=$(echo "$proxied_list" | sed -n "${count}p" | xargs)
+        local ttl=$(echo "$ttl_list" | sed -n "${count}p" | xargs)
         
-        # Use defaults if not specified
         [ -z "$interface" ] && interface="$DEFAULT_INTERFACE"
         [ -z "$api_token" ] && api_token="$DEFAULT_API_TOKEN"
         [ -z "$zone_id" ] && zone_id="$DEFAULT_ZONE_ID"
+        [ -z "$proxied" ] && proxied="$DEFAULT_PROXIED"
+        [ -z "$ttl" ] && ttl="$DEFAULT_TTL"
         
         local device=$(get_device "$interface")
         local current_ip=$(get_public_ip "$interface" "$device")
@@ -172,9 +173,9 @@ show_status() {
         
         if [ -f "$cache_file" ]; then
             local cached_ip=$(cat "$cache_file")
-            log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | Current IP: $current_ip | Cached IP: $cached_ip | Record ID: ${record_id:0:8}..."
+            log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | IP: $current_ip (cached) | Proxied: $proxied | TTL: $ttl | Record: ${record_id:0:8}..."
         else
-            log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | Current IP: $current_ip | No cache | Record ID: ${record_id:0:8}..."
+            log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | IP: $current_ip (no cache) | Proxied: $proxied | TTL: $ttl | Record: ${record_id:0:8}..."
         fi
     done
 }
@@ -204,54 +205,58 @@ case "$1" in
         echo "  --status          Show current status"
         echo "  --get-record-id   Get all A records and their IDs for all zones"
         echo "  --help, -h        Show this help"
-        echo ""
-        echo "Features:"
-        echo "  ✓ Multiple domains across different Cloudflare zones"
-        echo "  ✓ Each domain can use different interface (multi-WAN)"
-        echo "  ✓ Each domain can have different API token"
-        echo "  ✓ Smart caching to avoid unnecessary API calls"
-        echo "  ✓ Detailed logging with summary"
         exit 0
         ;;
 esac
 
 log_message "=== Starting Cloudflare DDNS Update (Multi-Zone + Multi-Interface) ==="
 
-# Parse all config arrays
-domains=$(echo "$CF_DOMAINS" | tr ',' '\n')
-interfaces=$(echo "$CF_INTERFACES" | tr ',' '\n')
-api_tokens=$(echo "$CF_API_TOKENS" | tr ',' '\n')
-zone_ids=$(echo "$CF_ZONE_IDS" | tr ',' '\n')
-record_ids=$(echo "$CF_RECORD_IDS" | tr ',' '\n')
+# Parse config arrays once
+domains_array=$(echo "$CF_DOMAINS" | tr ',' '\n')
+interfaces_array=$(echo "$CF_INTERFACES" | tr ',' '\n')
+api_tokens_array=$(echo "$CF_API_TOKENS" | tr ',' '\n')
+zone_ids_array=$(echo "$CF_ZONE_IDS" | tr ',' '\n')
+record_ids_array=$(echo "$CF_RECORD_IDS" | tr ',' '\n')
+proxied_array=$(echo "$CF_PROXIED" | tr ',' '\n')
+ttl_array=$(echo "$CF_TTL" | tr ',' '\n')
 
-count=0
 updated=0
 skipped=0
 failed=0
+count=0
 
-echo "$domains" | while read domain; do
-    domain=$(echo $domain | xargs)
+# Process each domain
+while IFS= read -r domain; do
+    domain=$(echo "$domain" | xargs)
     [ -z "$domain" ] && continue
     
     count=$((count + 1))
-    interface=$(echo "$interfaces" | sed -n "${count}p" | xargs)
-    api_token=$(echo "$api_tokens" | sed -n "${count}p" | xargs)
-    zone_id=$(echo "$zone_ids" | sed -n "${count}p" | xargs)
-    record_id=$(echo "$record_ids" | sed -n "${count}p" | xargs)
     
-    # Use defaults if not specified
+    # Get values for this domain
+    interface=$(echo "$interfaces_array" | sed -n "${count}p" | xargs)
+    api_token=$(echo "$api_tokens_array" | sed -n "${count}p" | xargs)
+    zone_id=$(echo "$zone_ids_array" | sed -n "${count}p" | xargs)
+    record_id=$(echo "$record_ids_array" | sed -n "${count}p" | xargs)
+    proxied=$(echo "$proxied_array" | sed -n "${count}p" | xargs)
+    ttl=$(echo "$ttl_array" | sed -n "${count}p" | xargs)
+    
+    # Use defaults if empty
     [ -z "$interface" ] && interface="$DEFAULT_INTERFACE"
     [ -z "$api_token" ] && api_token="$DEFAULT_API_TOKEN"
     [ -z "$zone_id" ] && zone_id="$DEFAULT_ZONE_ID"
+    [ -z "$proxied" ] && proxied="$DEFAULT_PROXIED"
+    [ -z "$ttl" ] && ttl="$DEFAULT_TTL"
+    
+    log_message "DEBUG: Parsed - Domain #$count: $domain, Proxied=[$proxied], TTL=[$ttl]"
     
     # Validate required fields
     if [ -z "$api_token" ] || [ -z "$zone_id" ] || [ -z "$record_id" ]; then
-        log_message "ERROR: Missing configuration for $domain (API Token/Zone ID/Record ID)"
+        log_message "ERROR: Missing configuration for $domain"
         failed=$((failed + 1))
         continue
     fi
     
-    # Get device for this interface
+    # Get device
     device=$(get_device "$interface")
     if [ -z "$device" ]; then
         log_message "ERROR: Cannot detect device for interface '$interface' (domain: $domain)"
@@ -259,20 +264,19 @@ echo "$domains" | while read domain; do
         continue
     fi
     
-    # Get current IP from this interface
+    # Get current IP
     current_ip=$(get_public_ip "$interface" "$device")
-    
     if [ -z "$current_ip" ]; then
         log_message "ERROR: Cannot get public IP from interface '$interface' (domain: $domain)"
         failed=$((failed + 1))
         continue
     fi
     
-    log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | IP: $current_ip"
+    log_message "Domain: $domain | Zone: ${zone_id:0:8}... | Interface: $interface | Device: $device | IP: $current_ip | Proxied: $proxied | TTL: $ttl"
     
+    # Check cache
     cache_file="${CACHE_DIR}/cf_ddns_ip_cache_$(echo $domain | sed 's/[^a-zA-Z0-9]/_/g')"
     
-    # Check if update needed
     if [ -f "$cache_file" ] && [ "$FORCE_UPDATE" -eq 0 ]; then
         cached_ip=$(cat "$cache_file")
         
@@ -284,9 +288,9 @@ echo "$domains" | while read domain; do
     fi
     
     # Update DNS
-    log_message "UPDATE: $domain - IP: $current_ip (from $interface)"
+    log_message "UPDATE: $domain - IP: $current_ip (from $interface, proxied: $proxied, ttl: $ttl)"
     
-    if update_dns_record "$api_token" "$zone_id" "$record_id" "$domain" "$current_ip" "${CF_PROXIED:-false}" "${CF_TTL:-120}"; then
+    if update_dns_record "$api_token" "$zone_id" "$record_id" "$domain" "$current_ip" "$proxied" "$ttl"; then
         echo "$current_ip" > "$cache_file"
         log_message "SUCCESS: $domain updated to $current_ip"
         updated=$((updated + 1))
@@ -294,6 +298,9 @@ echo "$domains" | while read domain; do
         log_message "FAILED: $domain update failed"
         failed=$((failed + 1))
     fi
-done
+    
+done << EOF
+$domains_array
+EOF
 
 log_message "=== Summary: Updated=$updated, Skipped=$skipped, Failed=$failed ==="
